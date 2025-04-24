@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log"
 	"os"
 	"strings"
@@ -14,310 +13,6 @@ import (
 
 	"github.com/nats-io/nats.go"
 )
-
-var (
-	_ os.FileInfo    = (*NatsFileData)(nil)
-	_ fs.ReadDirFile = (*NatsFileImpl)(nil)
-)
-
-// File represents a file in the filesystem.
-type File interface {
-	io.Closer
-	io.Reader
-	io.ReaderAt
-	io.Seeker
-	io.Writer
-	io.WriterAt
-
-	Name() string
-	Readdir(count int) ([]os.FileInfo, error)
-	Readdirnames(n int) ([]string, error)
-	Stat() (os.FileInfo, error)
-	Sync() error
-	Truncate(size int64) error
-	WriteString(s string) (ret int, err error)
-}
-
-// Fs is the filesystem interface.
-//
-// Any simulated or real filesystem should implement this interface.
-type Fs interface {
-	// Create creates a file in the filesystem, returning the file and an
-	// error, if any happens.
-	Create(name string) (File, error)
-
-	// Mkdir creates a directory in the filesystem, return an error if any
-	// happens.
-	Mkdir(name string, perm os.FileMode) error
-
-	// MkdirAll creates a directory path and all parents that does not exist
-	// yet.
-	MkdirAll(path string, perm os.FileMode) error
-
-	// Open opens a file, returning it or an error, if any happens.
-	Open(name string) (File, error)
-
-	// OpenFile opens a file using the given flags and the given mode.
-	OpenFile(name string, flag int, perm os.FileMode) (File, error)
-
-	// Remove removes a file identified by name, returning an error, if any
-	// happens.
-	Remove(name string) error
-
-	// RemoveAll removes a directory path and any children it contains. It
-	// does not fail if the path does not exist (return nil).
-	RemoveAll(path string) error
-
-	// Rename renames a file.
-	Rename(oldname, newname string) error
-
-	// Stat returns a FileInfo describing the named file, or an error, if any
-	// happens.
-	Stat(name string) (os.FileInfo, error)
-
-	// Name The name of this FileSystem
-	Name() string
-
-	// Chmod changes the mode of the named file to mode.
-	Chmod(name string, mode os.FileMode) error
-
-	// Chown changes the uid and gid of the named file.
-	Chown(name string, uid, gid int) error
-
-	// Chtimes changes the access and modification times of the named file
-	Chtimes(name string, atime time.Time, mtime time.Time) error
-}
-
-type NatsFileImpl struct {
-	data     *NatsFileData
-	fs       *NatsFs
-	position int64
-	mu       sync.RWMutex
-}
-
-func (f *NatsFileImpl) Close() error {
-	return f.fs.Save(f.data)
-}
-
-func (f *NatsFileImpl) Read(p []byte) (n int, err error) {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-
-	if f.position >= int64(len(f.data.Data)) {
-		return 0, io.EOF
-	}
-
-	n = copy(p, f.data.Data[f.position:])
-	f.position += int64(n)
-	return n, nil
-}
-
-func (f *NatsFileImpl) ReadAt(p []byte, off int64) (n int, err error) {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-
-	if off < 0 {
-		return 0, errors.New("negative offset")
-	}
-	if off >= int64(len(f.data.Data)) {
-		return 0, io.EOF
-	}
-
-	n = copy(p, f.data.Data[off:])
-	if n < len(p) {
-		err = io.EOF
-	}
-	return n, err
-}
-
-func (f *NatsFileImpl) Seek(offset int64, whence int) (int64, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	var abs int64
-	switch whence {
-	case io.SeekStart:
-		abs = offset
-	case io.SeekCurrent:
-		abs = f.position + offset
-	case io.SeekEnd:
-		abs = int64(len(f.data.Data)) + offset
-	default:
-		return 0, errors.New("invalid whence")
-	}
-
-	if abs < 0 {
-		return 0, errors.New("negative position")
-	}
-
-	f.position = abs
-	return abs, nil
-}
-
-func (f *NatsFileImpl) Write(p []byte) (n int, err error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	// Ensure capacity
-	if required := int(f.position) + len(p); required > len(f.data.Data) {
-		newData := make([]byte, required)
-		copy(newData, f.data.Data)
-		f.data.Data = newData
-	}
-
-	n = copy(f.data.Data[f.position:], p)
-	f.position += int64(n)
-	f.data.ObjectModTime = time.Now()
-	return n, nil
-}
-
-func (f *NatsFileImpl) WriteAt(p []byte, off int64) (n int, err error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if off < 0 {
-		return 0, errors.New("negative offset")
-	}
-
-	// Ensure capacity
-	if required := int(off) + len(p); required > len(f.data.Data) {
-		newData := make([]byte, required)
-		copy(newData, f.data.Data)
-		f.data.Data = newData
-	}
-
-	n = copy(f.data.Data[off:], p)
-	f.data.ObjectModTime = time.Now()
-	return n, nil
-}
-
-func (f *NatsFileImpl) Name() string {
-	return f.data.ObjectName
-}
-
-func (f *NatsFileImpl) Readdir(count int) ([]os.FileInfo, error) {
-	if !f.data.ObjectIsDir {
-		return nil, errors.New("not a directory")
-	}
-
-	files, err := f.fs.List(f.data.ObjectName)
-	if err != nil {
-		return nil, err
-	}
-
-	var fileInfos []os.FileInfo
-	for _, file := range files {
-		fileInfos = append(fileInfos, file)
-	}
-
-	if count > 0 {
-		if count > len(fileInfos) {
-			count = len(fileInfos)
-		}
-		fileInfos = fileInfos[:count]
-	}
-
-	return fileInfos, nil
-}
-
-func (f *NatsFileImpl) ReadDir(n int) ([]fs.DirEntry, error) {
-	files, err := f.Readdir(n)
-	if err != nil {
-		return nil, err
-	}
-	entries := make([]fs.DirEntry, len(files))
-	for i, fi := range files {
-		entries[i] = fs.FileInfoToDirEntry(fi)
-	}
-	return entries, nil
-}
-
-func (f *NatsFileImpl) Readdirnames(n int) ([]string, error) {
-	files, err := f.Readdir(n)
-	if err != nil {
-		return nil, err
-	}
-
-	names := make([]string, len(files))
-	for i, file := range files {
-		names[i] = file.Name()
-	}
-	return names, nil
-}
-
-func (f *NatsFileImpl) Stat() (os.FileInfo, error) {
-	return f.data, nil
-}
-
-func (f *NatsFileImpl) Sync() error {
-	f.fs.lockFile(f.data.ObjectName)
-	defer f.fs.unlockFile(f.data.ObjectName)
-	return f.fs.Save(f.data)
-}
-
-func (f *NatsFileImpl) Truncate(size int64) error {
-	if size < 0 {
-		return errors.New("negative size")
-	}
-	f.fs.lockFile(f.data.ObjectName)
-	defer f.fs.unlockFile(f.data.ObjectName)
-
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if size > int64(len(f.data.Data)) {
-		newData := make([]byte, size)
-		copy(newData, f.data.Data)
-		f.data.Data = newData
-	} else {
-		f.data.Data = f.data.Data[:size]
-	}
-	f.data.ObjectModTime = time.Now()
-	return nil
-}
-
-func (f *NatsFileImpl) WriteString(s string) (n int, err error) {
-	return f.Write([]byte(s))
-}
-
-type NatsFileData struct {
-	ObjectName    string
-	ObjectIsDir   bool
-	Data          []byte
-	ObjectMode    os.FileMode
-	ObjectModTime time.Time
-}
-
-func NewNatsFile(data *NatsFileData, fs *NatsFs) File {
-	return &NatsFileImpl{
-		data: data,
-		fs:   fs,
-	}
-}
-
-func (f *NatsFileData) Name() string {
-	return f.ObjectName
-}
-
-func (f *NatsFileData) Size() int64 {
-	return int64(len(f.Data))
-}
-
-func (f *NatsFileData) Mode() os.FileMode {
-	return f.ObjectMode
-}
-
-func (f *NatsFileData) ModTime() time.Time {
-	return f.ObjectModTime
-}
-
-func (f *NatsFileData) IsDir() bool {
-	return f.ObjectIsDir
-}
-
-func (f *NatsFileData) Sys() any {
-	return nil
-}
 
 type StorageType int
 
@@ -341,18 +36,6 @@ type Config struct {
 func (c *Config) validate() error {
 	if c.Bucket == "" {
 		return errors.New("bucket name is required")
-	}
-
-	if c.ConnectionID == "" {
-		return errors.New("connection id is required")
-	}
-
-	if c.MountPath == "" {
-		return errors.New("mount path is required")
-	}
-
-	if c.TTL == 0 {
-		return errors.New("ttl is required")
 	}
 	return nil
 }
@@ -388,9 +71,17 @@ func NewNatsFs(js nats.JetStreamContext, config Config) (Fs, error) {
 		return nil, err
 	}
 
-	store, err := js.CreateObjectStore(config.objectStoreConfig())
-	if err != nil && !errors.Is(err, nats.ErrBucketNotFound) {
-		return nil, err
+	store, err := js.ObjectStore(config.Bucket)
+	if err != nil {
+		if errors.Is(err, nats.ErrStreamNotFound) {
+			// Store doesn't exist, try to create it
+			store, err = js.CreateObjectStore(config.objectStoreConfig())
+			if err != nil {
+				return nil, fmt.Errorf("failed to create object store: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("failed to get object store: %w", err)
+		}
 	}
 
 	return &NatsFs{
@@ -566,8 +257,7 @@ func (n *NatsFs) Create(name string) (File, error) {
 		ObjectModTime: time.Now(),
 	}
 
-	err := n.Save(file)
-	if err != nil {
+	if err := n.Save(file); err != nil {
 		return nil, err
 	}
 
