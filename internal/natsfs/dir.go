@@ -1,3 +1,7 @@
+// Package natsfs provides a filesystem implementation backed by NATS Object Store.
+// It implements a virtual filesystem that stores and retrieves files using NATS
+// Object Store as the underlying storage mechanism, with support for caching
+// and atomic operations.
 package natsfs
 
 import (
