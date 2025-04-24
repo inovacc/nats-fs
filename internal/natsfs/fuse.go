@@ -2,6 +2,9 @@ package natsfs
 
 import (
 	"context"
+	"io"
+	"os"
+	"strings"
 	"syscall"
 
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -21,6 +24,10 @@ type NatsFileNode struct {
 }
 
 func MountNatsFs(mountPoint string, nfs *NatsFs) error {
+	if isMountPoint(mountPoint) {
+		return syscall.EBUSY
+	}
+
 	root := &NatsFsRoot{nfs: nfs}
 	server, err := fs.Mount(mountPoint, root, &fs.Options{
 		MountOptions: fuse.MountOptions{
@@ -64,4 +71,44 @@ func (r *NatsFsRoot) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) 
 		})
 	}
 	return fs.NewListDirStream(entries), fs.OK
+}
+
+func (n *NatsFileNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	info, err := n.fsys.Stat(n.name)
+	if err != nil {
+		return syscall.ENOENT
+	}
+	out.Mode = uint32(info.Mode())
+	out.Size = uint64(info.Size())
+	out.Mtime = uint64(info.ModTime().Unix())
+	out.Ctime = out.Mtime
+	out.Atime = out.Mtime
+	out.Nlink = 1
+	return fs.OK
+}
+
+func (n *NatsFileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	f, err := n.fsys.Open(n.name)
+	if err != nil {
+		return nil, 0, syscall.ENOENT
+	}
+	n.file = f
+	return n, fuse.FOPEN_KEEP_CACHE, fs.OK
+}
+
+func (n *NatsFileNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	buf := make([]byte, len(dest))
+	nRead, err := n.file.ReadAt(buf, off)
+	if err != nil && err != io.EOF {
+		return nil, syscall.EIO
+	}
+	return fuse.ReadResultData(buf[:nRead]), fs.OK
+}
+
+func isMountPoint(path string) bool {
+	mounts, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(mounts), path)
 }
