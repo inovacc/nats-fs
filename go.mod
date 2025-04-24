@@ -1,4 +1,4 @@
-module awesomeProjectNATS_fs
+module github.com/inovacc/nats-fs
 
 go 1.24
 

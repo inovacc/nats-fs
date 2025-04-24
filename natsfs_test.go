@@ -1,4 +1,4 @@
-package natsfs
+package awesomeProjectNATS_fs
 
 import (
 	"encoding/json"
