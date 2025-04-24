@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"strings"
 	"sync"
@@ -249,6 +250,8 @@ func (f *NatsFileImpl) Stat() (os.FileInfo, error) {
 }
 
 func (f *NatsFileImpl) Sync() error {
+	f.fs.lockFile(f.data.ObjectName)
+	defer f.fs.unlockFile(f.data.ObjectName)
 	return f.fs.Save(f.data)
 }
 
@@ -256,6 +259,8 @@ func (f *NatsFileImpl) Truncate(size int64) error {
 	if size < 0 {
 		return errors.New("negative size")
 	}
+	f.fs.lockFile(f.data.ObjectName)
+	defer f.fs.unlockFile(f.data.ObjectName)
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -267,7 +272,6 @@ func (f *NatsFileImpl) Truncate(size int64) error {
 	} else {
 		f.data.Data = f.data.Data[:size]
 	}
-
 	f.data.ObjectModTime = time.Now()
 	return nil
 }
@@ -334,35 +338,57 @@ type Config struct {
 	Storage      StorageType
 }
 
+func (c *Config) validate() error {
+	if c.Bucket == "" {
+		return errors.New("bucket name is required")
+	}
+
+	if c.ConnectionID == "" {
+		return errors.New("connection id is required")
+	}
+
+	if c.MountPath == "" {
+		return errors.New("mount path is required")
+	}
+
+	if c.TTL == 0 {
+		return errors.New("ttl is required")
+	}
+	return nil
+}
+
+func (c *Config) objectStoreConfig() *nats.ObjectStoreConfig {
+	natsConfig := &nats.ObjectStoreConfig{
+		TTL:         c.TTL,
+		Bucket:      c.Bucket,
+		Compression: c.Compression,
+		Description: c.Description,
+	}
+
+	switch c.Storage {
+	case FileStorage:
+		natsConfig.Storage = nats.FileStorage
+	case MemoryStorage:
+		natsConfig.Storage = nats.MemoryStorage
+	}
+	return natsConfig
+}
+
 // NatsFs represents a filesystem implementation backed by NATS Object Store.
 // It provides file operations with caching capabilities and path resolution.
 type NatsFs struct {
 	store   nats.ObjectStore
 	entries map[string]*NatsFileData
 	mu      sync.RWMutex
+	locks   map[string]*sync.Mutex
 }
 
 func NewNatsFs(js nats.JetStreamContext, config Config) (Fs, error) {
-	ttl := config.TTL
-	if ttl == 0 {
-		ttl = 24 * time.Hour
+	if err := config.validate(); err != nil {
+		return nil, err
 	}
 
-	natsConfig := &nats.ObjectStoreConfig{
-		TTL:         ttl,
-		Bucket:      config.Bucket,
-		Compression: config.Compression,
-		Description: config.Description,
-	}
-
-	switch config.Storage {
-	case FileStorage:
-		natsConfig.Storage = nats.FileStorage
-	case MemoryStorage:
-		natsConfig.Storage = nats.MemoryStorage
-	}
-
-	store, err := js.CreateObjectStore(natsConfig)
+	store, err := js.CreateObjectStore(config.objectStoreConfig())
 	if err != nil && !errors.Is(err, nats.ErrBucketNotFound) {
 		return nil, err
 	}
@@ -370,10 +396,33 @@ func NewNatsFs(js nats.JetStreamContext, config Config) (Fs, error) {
 	return &NatsFs{
 		store:   store,
 		entries: make(map[string]*NatsFileData),
+		locks:   make(map[string]*sync.Mutex),
 	}, nil
 }
 
+func (n *NatsFs) lockFile(name string) {
+	n.mu.Lock()
+	if _, exists := n.locks[name]; !exists {
+		n.locks[name] = &sync.Mutex{}
+	}
+	l := n.locks[name]
+	n.mu.Unlock()
+	l.Lock()
+}
+
+func (n *NatsFs) unlockFile(name string) {
+	n.mu.RLock()
+	if l, ok := n.locks[name]; ok {
+		l.Unlock()
+	}
+	n.mu.RUnlock()
+}
+
 func (n *NatsFs) Load(name string) (*NatsFileData, error) {
+	if name == "" {
+		return nil, errors.New("empty name not allowed")
+	}
+
 	n.mu.RLock()
 	entry, ok := n.entries[name]
 	n.mu.RUnlock()
@@ -383,20 +432,23 @@ func (n *NatsFs) Load(name string) (*NatsFileData, error) {
 
 	obj, err := n.store.Get(name)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get object: %w", err)
 	}
 	defer func(obj nats.ObjectResult) {
-		_ = obj.Close()
+		if err := obj.Close(); err != nil {
+			// Log or handle close error
+			log.Printf("error closing object: %v", err)
+		}
 	}(obj)
 
 	data, err := io.ReadAll(obj)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read object data: %w", err)
 	}
 
 	info, err := n.store.GetInfo(name)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get object info: %w", err)
 	}
 
 	file := &NatsFileData{
@@ -415,8 +467,14 @@ func (n *NatsFs) Load(name string) (*NatsFileData, error) {
 }
 
 func (n *NatsFs) Save(file *NatsFileData) error {
+	if file == nil {
+		return errors.New("error file is nil")
+	}
+	n.lockFile(file.ObjectName)
+	defer n.unlockFile(file.ObjectName)
+
 	if file.ObjectIsDir {
-		return nil // No actual write needed for dirs
+		return nil
 	}
 	_, err := n.store.Put(&nats.ObjectMeta{Name: file.ObjectName}, bytes.NewReader(file.Data))
 	if err == nil {
@@ -437,6 +495,21 @@ func (n *NatsFs) List(dir string) ([]*NatsFileData, error) {
 			rel := strings.TrimPrefix(name, prefix)
 			if !strings.Contains(rel, "/") {
 				files = append(files, file)
+			}
+		}
+	}
+
+	entries, err := n.store.List()
+	if err == nil {
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name, ".meta/dirs/") {
+				name := strings.TrimPrefix(e.Name, ".meta/dirs/")
+				files = append(files, &NatsFileData{
+					ObjectName:    name,
+					ObjectIsDir:   true,
+					ObjectMode:    os.ModeDir | 0755,
+					ObjectModTime: e.ModTime,
+				})
 			}
 		}
 	}
@@ -511,6 +584,11 @@ func (n *NatsFs) Mkdir(name string, perm os.FileMode) error {
 	n.mu.Lock()
 	n.entries[name] = dir
 	n.mu.Unlock()
+
+	// Backfill directory in the NATS store for remote listing
+	metaKey := fmt.Sprintf(".meta/dirs/%s", name)
+	_, _ = n.store.Put(&nats.ObjectMeta{Name: metaKey}, bytes.NewReader(nil))
+
 	return nil
 }
 
@@ -521,7 +599,7 @@ func (n *NatsFs) MkdirAll(path string, perm os.FileMode) error {
 		if current == "" {
 			current = part
 		} else {
-			current = current + "/" + part
+			current = fmt.Sprintf("%s/%s", current, part)
 		}
 		if _, exists := n.entries[current]; !exists {
 			if err := n.Mkdir(current, perm); err != nil {
@@ -568,13 +646,17 @@ func (n *NatsFs) RemoveAll(path string) error {
 	for name := range n.entries {
 		if name == path || strings.HasPrefix(name, path+"/") {
 			delete(n.entries, name)
-			_ = n.store.Delete(name) // ignore delete error
+			_ = n.store.Delete(name)
 		}
 	}
+	metaKey := fmt.Sprintf(".meta/dirs/%s", path)
+	_ = n.store.Delete(metaKey)
 	return nil
 }
 
 func (n *NatsFs) Rename(oldname, newname string) error {
+	n.lockFile(oldname)
+	defer n.unlockFile(oldname)
 	file, err := n.Load(oldname)
 	if err != nil {
 		return err
@@ -583,7 +665,15 @@ func (n *NatsFs) Rename(oldname, newname string) error {
 	if err := n.Save(file); err != nil {
 		return err
 	}
-	return n.Remove(oldname)
+	_ = n.Remove(oldname)
+
+	if file.ObjectIsDir {
+		oldMeta := fmt.Sprintf(".meta/dirs/%s", oldname)
+		newMeta := fmt.Sprintf(".meta/dirs/%s", newname)
+		_ = n.store.Delete(oldMeta)
+		_, _ = n.store.Put(&nats.ObjectMeta{Name: newMeta}, bytes.NewReader(nil))
+	}
+	return nil
 }
 
 func (n *NatsFs) Name() string {
