@@ -385,7 +385,9 @@ func (n *NatsFs) Load(name string) (*NatsFileData, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer obj.Close()
+	defer func(obj nats.ObjectResult) {
+		_ = obj.Close()
+	}(obj)
 
 	data, err := io.ReadAll(obj)
 	if err != nil {
@@ -500,28 +502,76 @@ func (n *NatsFs) Create(name string) (File, error) {
 }
 
 func (n *NatsFs) Mkdir(name string, perm os.FileMode) error {
-	// TODO implement me
-	panic("implement me")
+	dir := &NatsFileData{
+		ObjectName:    name,
+		ObjectIsDir:   true,
+		ObjectMode:    perm | os.ModeDir,
+		ObjectModTime: time.Now(),
+	}
+	n.mu.Lock()
+	n.entries[name] = dir
+	n.mu.Unlock()
+	return nil
 }
 
 func (n *NatsFs) MkdirAll(path string, perm os.FileMode) error {
-	// TODO implement me
-	panic("implement me")
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	current := ""
+	for _, part := range parts {
+		if current == "" {
+			current = part
+		} else {
+			current = current + "/" + part
+		}
+		if _, exists := n.entries[current]; !exists {
+			if err := n.Mkdir(current, perm); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (n *NatsFs) Open(name string) (File, error) {
-	// TODO implement me
-	panic("implement me")
+	entry, err := n.Load(name)
+	if err != nil {
+		return nil, err
+	}
+	return NewNatsFile(entry, n), nil
 }
 
 func (n *NatsFs) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
-	// TODO implement me
-	panic("implement me")
+	switch {
+	case flag&os.O_CREATE != 0:
+		entry, exists := n.entries[name]
+		if !exists {
+			entry = &NatsFileData{
+				ObjectName:    name,
+				ObjectIsDir:   false,
+				ObjectMode:    perm,
+				ObjectModTime: time.Now(),
+				Data:          []byte{},
+			}
+			n.entries[name] = entry
+		} else if flag&os.O_TRUNC != 0 {
+			entry.Data = []byte{}
+		}
+		return NewNatsFile(entry, n), nil
+	default:
+		return n.Open(name)
+	}
 }
 
 func (n *NatsFs) RemoveAll(path string) error {
-	// TODO implement me
-	panic("implement me")
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for name := range n.entries {
+		if name == path || strings.HasPrefix(name, path+"/") {
+			delete(n.entries, name)
+			_ = n.store.Delete(name) // ignore delete error
+		}
+	}
+	return nil
 }
 
 func (n *NatsFs) Rename(oldname, newname string) error {
@@ -537,21 +587,32 @@ func (n *NatsFs) Rename(oldname, newname string) error {
 }
 
 func (n *NatsFs) Name() string {
-	// TODO implement me
-	panic("implement me")
+	return "natsfs"
 }
 
 func (n *NatsFs) Chmod(name string, mode os.FileMode) error {
-	// TODO implement me
-	panic("implement me")
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	entry, exists := n.entries[name]
+	if !exists {
+		return os.ErrNotExist
+	}
+	entry.ObjectMode = mode
+	return nil
 }
 
 func (n *NatsFs) Chown(name string, uid, gid int) error {
-	// TODO implement me
-	panic("implement me")
+	// Not applicable for NATS Object Store, so we no-op.
+	return nil
 }
 
 func (n *NatsFs) Chtimes(name string, atime time.Time, mtime time.Time) error {
-	// TODO implement me
-	panic("implement me")
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	entry, exists := n.entries[name]
+	if !exists {
+		return os.ErrNotExist
+	}
+	entry.ObjectModTime = mtime
+	return nil
 }
