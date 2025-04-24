@@ -1,3 +1,5 @@
+//go:build !windows
+
 package natsfs
 
 import (
@@ -103,6 +105,28 @@ func (n *NatsFileNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte, 
 		return nil, syscall.EIO
 	}
 	return fuse.ReadResultData(buf[:nRead]), fs.OK
+}
+
+func (n *NatsFileNode) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
+	nWritten, err := n.file.WriteAt(data, off)
+	if err != nil {
+		return 0, syscall.EIO
+	}
+	return uint32(nWritten), fs.OK
+}
+
+func (r *NatsFsRoot) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+	f, err := r.nfs.Create(name)
+	if err != nil {
+		return nil, nil, 0, syscall.EIO
+	}
+	fileNode := &NatsFileNode{
+		fsys: r.nfs,
+		name: name,
+		file: f,
+	}
+	inode := r.NewPersistentInode(ctx, fileNode, fs.StableAttr{Mode: mode})
+	return inode, fileNode, fuse.FOPEN_KEEP_CACHE, fs.OK
 }
 
 func isMountPoint(path string) bool {
