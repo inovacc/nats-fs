@@ -9,20 +9,42 @@ import (
 
 	"github.com/brianvoe/gofakeit/v7"
 	"github.com/inovacc/utils/v2/uid"
+	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
+func runEmbeddedServer() *server.Server {
+	opts := &server.Options{
+		Port:      -1,
+		JetStream: true,
+	}
+	s, err := server.NewServer(opts)
+	if err != nil {
+		panic(err)
+	}
+	go s.Start()
+	if !s.ReadyForConnections(10 * time.Second) {
+		panic("nats server didn't start")
+	}
+	return s
+}
+
 func setupTestFS(t *testing.T) Fs {
-	nc, err := nats.Connect(nats.DefaultURL)
+	s := runEmbeddedServer()
+	t.Cleanup(func() {
+		s.Shutdown()
+	})
+
+	nc, err := nats.Connect(s.ClientURL())
 	require.NoError(t, err)
+	t.Cleanup(func() { nc.Close() })
 
 	js, err := nc.JetStream()
 	require.NoError(t, err)
 
-	bucket := "test-fs" // fmt.Sprintf("test-%s", uid.GenerateUUID())
-
+	bucket := "test-fs"
 	fsys, err := NewNatsFs(js, Config{
 		ConnectionID: uid.GenerateUUID(),
 		Bucket:       bucket,
@@ -31,10 +53,6 @@ func setupTestFS(t *testing.T) Fs {
 		Storage:      MemoryStorage,
 	})
 	require.NoError(t, err)
-
-	// t.Cleanup(func() {
-	// 	_ = js.DeleteObjectStore(bucket)
-	// })
 
 	return fsys
 }
