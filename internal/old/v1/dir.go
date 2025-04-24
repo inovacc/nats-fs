@@ -2,7 +2,7 @@
 // It implements a virtual filesystem that stores and retrieves files using NATS
 // Object Store as the underlying storage mechanism, with support for caching
 // and atomic operations.
-package natsfs
+package v1
 
 import (
 	"io"

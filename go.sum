@@ -1,3 +1,9 @@
+github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
+github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
+github.com/inovacc/ksuid v1.0.0 h1:zTe8CO86pVsgogAM2D/1x+DV3uS0ZcMhKDkqtKOOvS4=
+github.com/inovacc/ksuid v1.0.0/go.mod h1:t2zVMADGYfPQ+kYgqb3AocpTq8XyMdgrOQ+IHye9RAs=
+github.com/inovacc/utils/v2 v2.2.4 h1:xVwSxq0AqZRglXFQN5lJg21Yh8iDTVwU9O6wvBTHhiw=
+github.com/inovacc/utils/v2 v2.2.4/go.mod h1:o21Ndi9Cw/G0cp3gEm9J59p6dhACsitQGHJftSO5vnk=
 github.com/klauspost/compress v1.18.0 h1:c/Cqfb0r+Yi+JtIEq73FWXVkRonBlf0CRNYc8Zttxdo=
 github.com/klauspost/compress v1.18.0/go.mod h1:2Pp+KzxcywXVXMr50+X0Q/Lsb43OQHYWRCY2AiWywWQ=
 github.com/nats-io/nats.go v1.41.2 h1:5UkfLAtu/036s99AhFRlyNDI1Ieylb36qbGjJzHixos=

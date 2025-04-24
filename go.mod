@@ -2,9 +2,14 @@ module awesomeProjectNATS_fs
 
 go 1.24
 
-require github.com/nats-io/nats.go v1.41.2
+require (
+	github.com/inovacc/utils/v2 v2.2.4
+	github.com/nats-io/nats.go v1.41.2
+)
 
 require (
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/inovacc/ksuid v1.0.0 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/nats-io/nkeys v0.4.11 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect

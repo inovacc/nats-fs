@@ -1,7 +1,3 @@
-// Package natsfs provides a filesystem implementation backed by NATS Object Store.
-// It implements a virtual filesystem that stores and retrieves files using NATS
-// Object Store as the underlying storage mechanism, with support for caching
-// and atomic operations.
 package natsfs
 
 import (
@@ -9,10 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
-	"net/http"
+	"io/fs"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -20,317 +14,544 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+var (
+	_ os.FileInfo    = (*NatsFileData)(nil)
+	_ fs.ReadDirFile = (*NatsFileImpl)(nil)
+)
+
+// File represents a file in the filesystem.
+type File interface {
+	io.Closer
+	io.Reader
+	io.ReaderAt
+	io.Seeker
+	io.Writer
+	io.WriterAt
+
+	Name() string
+	Readdir(count int) ([]os.FileInfo, error)
+	Readdirnames(n int) ([]string, error)
+	Stat() (os.FileInfo, error)
+	Sync() error
+	Truncate(size int64) error
+	WriteString(s string) (ret int, err error)
+}
+
+// Fs is the filesystem interface.
+//
+// Any simulated or real filesystem should implement this interface.
+type Fs interface {
+	// Create creates a file in the filesystem, returning the file and an
+	// error, if any happens.
+	Create(name string) (File, error)
+
+	// Mkdir creates a directory in the filesystem, return an error if any
+	// happens.
+	Mkdir(name string, perm os.FileMode) error
+
+	// MkdirAll creates a directory path and all parents that does not exist
+	// yet.
+	MkdirAll(path string, perm os.FileMode) error
+
+	// Open opens a file, returning it or an error, if any happens.
+	Open(name string) (File, error)
+
+	// OpenFile opens a file using the given flags and the given mode.
+	OpenFile(name string, flag int, perm os.FileMode) (File, error)
+
+	// Remove removes a file identified by name, returning an error, if any
+	// happens.
+	Remove(name string) error
+
+	// RemoveAll removes a directory path and any children it contains. It
+	// does not fail if the path does not exist (return nil).
+	RemoveAll(path string) error
+
+	// Rename renames a file.
+	Rename(oldname, newname string) error
+
+	// Stat returns a FileInfo describing the named file, or an error, if any
+	// happens.
+	Stat(name string) (os.FileInfo, error)
+
+	// Name The name of this FileSystem
+	Name() string
+
+	// Chmod changes the mode of the named file to mode.
+	Chmod(name string, mode os.FileMode) error
+
+	// Chown changes the uid and gid of the named file.
+	Chown(name string, uid, gid int) error
+
+	// Chtimes changes the access and modification times of the named file
+	Chtimes(name string, atime time.Time, mtime time.Time) error
+}
+
+type NatsFileImpl struct {
+	data     *NatsFileData
+	fs       *NatsFs
+	position int64
+	mu       sync.RWMutex
+}
+
+func (f *NatsFileImpl) Close() error {
+	return f.fs.Save(f.data)
+}
+
+func (f *NatsFileImpl) Read(p []byte) (n int, err error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	if f.position >= int64(len(f.data.Data)) {
+		return 0, io.EOF
+	}
+
+	n = copy(p, f.data.Data[f.position:])
+	f.position += int64(n)
+	return n, nil
+}
+
+func (f *NatsFileImpl) ReadAt(p []byte, off int64) (n int, err error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	if off < 0 {
+		return 0, errors.New("negative offset")
+	}
+	if off >= int64(len(f.data.Data)) {
+		return 0, io.EOF
+	}
+
+	n = copy(p, f.data.Data[off:])
+	if n < len(p) {
+		err = io.EOF
+	}
+	return n, err
+}
+
+func (f *NatsFileImpl) Seek(offset int64, whence int) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var abs int64
+	switch whence {
+	case io.SeekStart:
+		abs = offset
+	case io.SeekCurrent:
+		abs = f.position + offset
+	case io.SeekEnd:
+		abs = int64(len(f.data.Data)) + offset
+	default:
+		return 0, errors.New("invalid whence")
+	}
+
+	if abs < 0 {
+		return 0, errors.New("negative position")
+	}
+
+	f.position = abs
+	return abs, nil
+}
+
+func (f *NatsFileImpl) Write(p []byte) (n int, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	// Ensure capacity
+	if required := int(f.position) + len(p); required > len(f.data.Data) {
+		newData := make([]byte, required)
+		copy(newData, f.data.Data)
+		f.data.Data = newData
+	}
+
+	n = copy(f.data.Data[f.position:], p)
+	f.position += int64(n)
+	f.data.ObjectModTime = time.Now()
+	return n, nil
+}
+
+func (f *NatsFileImpl) WriteAt(p []byte, off int64) (n int, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if off < 0 {
+		return 0, errors.New("negative offset")
+	}
+
+	// Ensure capacity
+	if required := int(off) + len(p); required > len(f.data.Data) {
+		newData := make([]byte, required)
+		copy(newData, f.data.Data)
+		f.data.Data = newData
+	}
+
+	n = copy(f.data.Data[off:], p)
+	f.data.ObjectModTime = time.Now()
+	return n, nil
+}
+
+func (f *NatsFileImpl) Name() string {
+	return f.data.ObjectName
+}
+
+func (f *NatsFileImpl) Readdir(count int) ([]os.FileInfo, error) {
+	if !f.data.ObjectIsDir {
+		return nil, errors.New("not a directory")
+	}
+
+	files, err := f.fs.List(f.data.ObjectName)
+	if err != nil {
+		return nil, err
+	}
+
+	var fileInfos []os.FileInfo
+	for _, file := range files {
+		fileInfos = append(fileInfos, file)
+	}
+
+	if count > 0 {
+		if count > len(fileInfos) {
+			count = len(fileInfos)
+		}
+		fileInfos = fileInfos[:count]
+	}
+
+	return fileInfos, nil
+}
+
+func (f *NatsFileImpl) ReadDir(n int) ([]fs.DirEntry, error) {
+	files, err := f.Readdir(n)
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]fs.DirEntry, len(files))
+	for i, fi := range files {
+		entries[i] = fs.FileInfoToDirEntry(fi)
+	}
+	return entries, nil
+}
+
+func (f *NatsFileImpl) Readdirnames(n int) ([]string, error) {
+	files, err := f.Readdir(n)
+	if err != nil {
+		return nil, err
+	}
+
+	names := make([]string, len(files))
+	for i, file := range files {
+		names[i] = file.Name()
+	}
+	return names, nil
+}
+
+func (f *NatsFileImpl) Stat() (os.FileInfo, error) {
+	return f.data, nil
+}
+
+func (f *NatsFileImpl) Sync() error {
+	return f.fs.Save(f.data)
+}
+
+func (f *NatsFileImpl) Truncate(size int64) error {
+	if size < 0 {
+		return errors.New("negative size")
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if size > int64(len(f.data.Data)) {
+		newData := make([]byte, size)
+		copy(newData, f.data.Data)
+		f.data.Data = newData
+	} else {
+		f.data.Data = f.data.Data[:size]
+	}
+
+	f.data.ObjectModTime = time.Now()
+	return nil
+}
+
+func (f *NatsFileImpl) WriteString(s string) (n int, err error) {
+	return f.Write([]byte(s))
+}
+
+type NatsFileData struct {
+	ObjectName    string
+	ObjectIsDir   bool
+	Data          []byte
+	ObjectMode    os.FileMode
+	ObjectModTime time.Time
+}
+
+func NewNatsFile(data *NatsFileData, fs *NatsFs) File {
+	return &NatsFileImpl{
+		data: data,
+		fs:   fs,
+	}
+}
+
+func (f *NatsFileData) Name() string {
+	return f.ObjectName
+}
+
+func (f *NatsFileData) Size() int64 {
+	return int64(len(f.Data))
+}
+
+func (f *NatsFileData) Mode() os.FileMode {
+	return f.ObjectMode
+}
+
+func (f *NatsFileData) ModTime() time.Time {
+	return f.ObjectModTime
+}
+
+func (f *NatsFileData) IsDir() bool {
+	return f.ObjectIsDir
+}
+
+func (f *NatsFileData) Sys() any {
+	return nil
+}
+
+type StorageType int
+
+const (
+	// FileStorage specifies on disk storage. It's the default.
+	FileStorage StorageType = iota
+	// MemoryStorage specifies in memory only.
+	MemoryStorage
+)
+
+type Config struct {
+	ConnectionID string
+	MountPath    string
+	Description  string
+	Bucket       string
+	TTL          time.Duration
+	Compression  bool
+	Storage      StorageType
+}
+
 // NatsFs represents a filesystem implementation backed by NATS Object Store.
 // It provides file operations with caching capabilities and path resolution.
 type NatsFs struct {
-	sync.RWMutex
-	store        nats.ObjectStore
-	connectionID string
-	mountPath    string
-	cache        map[string]*cacheEntry
-	ttl          time.Duration
+	store   nats.ObjectStore
+	entries map[string]*NatsFileData
+	mu      sync.RWMutex
 }
 
-// NewNatsFs creates a new NATS filesystem instance.
-// It requires a connection ID, mount path, and an initialized NATS Object Store.
-// The mount path will be normalized to ensure consistent path handling.
-func NewNatsFs(connectionID, mountPath string, store nats.ObjectStore) (*NatsFs, error) {
+func NewNatsFs(js nats.JetStreamContext, config Config) (Fs, error) {
+	ttl := config.TTL
+	if ttl == 0 {
+		ttl = 24 * time.Hour
+	}
+
+	natsConfig := &nats.ObjectStoreConfig{
+		TTL:         ttl,
+		Bucket:      config.Bucket,
+		Compression: config.Compression,
+		Description: config.Description,
+	}
+
+	switch config.Storage {
+	case FileStorage:
+		natsConfig.Storage = nats.FileStorage
+	case MemoryStorage:
+		natsConfig.Storage = nats.MemoryStorage
+	}
+
+	store, err := js.CreateObjectStore(natsConfig)
+	if err != nil && !errors.Is(err, nats.ErrBucketNotFound) {
+		return nil, err
+	}
+
 	return &NatsFs{
-		store:        store,
-		connectionID: connectionID,
-		mountPath:    getMountPath(mountPath),
+		store:   store,
+		entries: make(map[string]*NatsFileData),
 	}, nil
 }
 
-func (fs *NatsFs) getCached(name string) (*cacheEntry, bool) {
-	fs.RLock()
-	defer fs.RUnlock()
-
-	entry, exists := fs.cache[name]
-	if !exists || entry.isExpired() {
-		return nil, false
-	}
-	return entry, true
-}
-
-func (fs *NatsFs) setCached(name string, info *nats.ObjectInfo, data []byte) {
-	fs.Lock()
-	defer fs.Unlock()
-	fs.cache[name] = newCacheEntry(info, data, fs.ttl)
-}
-
-func (fs *NatsFs) invalidateCache(name string) {
-	fs.Lock()
-	defer fs.Unlock()
-
-	delete(fs.cache, name)
-}
-
-func (fs *NatsFs) mapNATSError(err error) error {
-	if err == nil {
-		return nil
-	}
-	switch {
-	case errors.Is(err, nats.ErrObjectNotFound):
-		return os.ErrNotExist
-	case errors.Is(err, nats.ErrInvalidKey):
-		return os.ErrInvalid
-	default:
-		return err
-	}
-}
-
-// GetMimeType attempts to detect the MIME type of file by its extension or content.
-// If the extension-based detection fails, it reads the first 512 bytes of the file
-// for content-based detection.
-func (fs *NatsFs) GetMimeType(name string) (string, error) {
-	// Try to detect the MIME type based on an extension file
-	if ext := filepath.Ext(name); ext != "" {
-		if mimeType := mime.TypeByExtension(ext); mimeType != "" {
-			return mimeType, nil
-		}
+func (n *NatsFs) Load(name string) (*NatsFileData, error) {
+	n.mu.RLock()
+	entry, ok := n.entries[name]
+	n.mu.RUnlock()
+	if ok {
+		return entry, nil
 	}
 
-	// If the extension-based detection fails, it reads the first 512 bytes of the file
-	obj, err := fs.store.Get(name)
-	if err != nil {
-		return "application/octet-stream", err
-	}
-	defer func(obj nats.ObjectResult) {
-		_ = obj.Close()
-	}(obj)
-
-	// Read the first 512 bytes to detect the MIME type
-	buffer := make([]byte, 512)
-	n, err := obj.Read(buffer)
-	if err != nil && err != io.EOF {
-		return "application/octet-stream", err
-	}
-
-	return http.DetectContentType(buffer[:n]), nil
-}
-
-// Walk recursively traverses the filesystem starting from root, calling walkFn
-// for each file or directory encountered.
-func (fs *NatsFs) Walk(root string, walkFn filepath.WalkFunc) error {
-	objects, err := fs.store.List()
-	if err != nil {
-		return err
-	}
-
-	// First call walkFn in the root directory
-	info := NewFileInfo(root, true, 0, time.Now(), true)
-	if err := walkFn(root, info, nil); err != nil {
-		return err
-	}
-
-	// Process all the objects
-	for _, obj := range objects {
-		path := obj.Name
-		if !strings.HasPrefix(path, root) {
-			continue
-		}
-
-		info := NewFileInfo(path, false, int64(obj.Size), obj.ModTime, false)
-		if err := walkFn(path, info, nil); err != nil {
-			if errors.Is(err, filepath.SkipDir) {
-				continue
-			}
-			return err
-		}
-	}
-
-	return nil
-}
-
-// ResolvePath converts a virtual path to its actual filesystem path.
-// It ensures the path is within the mount point and returns the relative path.
-func (fs *NatsFs) ResolvePath(virtualPath string) (string, error) {
-	// Ensure the path is clean and normalized
-	cleanPath := filepath.Clean(virtualPath)
-	if !strings.HasPrefix(cleanPath, fs.mountPath) {
-		return "", fmt.Errorf("path %s outside of mount point %s", virtualPath, fs.mountPath)
-	}
-
-	// Remove dot prefix if present
-	relPath := strings.TrimPrefix(cleanPath, fs.mountPath)
-	if relPath == "" {
-		relPath = "/"
-	}
-	return relPath, nil
-}
-
-// ReadDir returns a directory listing for the specified path.
-// It returns a NatsDirLister that provides access to the directory entries.
-func (fs *NatsFs) ReadDir(dirname string) (*NatsDirLister, error) {
-	// Implement mount point support for directories
-	objects, err := fs.store.List()
+	obj, err := n.store.Get(name)
 	if err != nil {
 		return nil, err
 	}
-
-	var entries []os.FileInfo
-	prefix := dirname
-	if prefix != "/" {
-		prefix = prefix + "/"
-	}
-
-	for _, obj := range objects {
-		// Only include objects in the current directory
-		if strings.HasPrefix(obj.Name, prefix) {
-			relPath := strings.TrimPrefix(obj.Name, prefix)
-			if !strings.Contains(relPath, "/") {
-				entries = append(entries, NewFileInfo(
-					obj.Name,
-					false,
-					int64(obj.Size),
-					obj.ModTime,
-					false,
-				))
-			}
-		}
-	}
-
-	return &NatsDirLister{entries: entries, pos: 0}, nil
-}
-
-// Name returns the name of the filesystem implementation ("natsfs").
-func (fs *NatsFs) Name() string {
-	return "natsfs"
-}
-
-// ConnectionID returns the connection identifier associated with this filesystem.
-func (fs *NatsFs) ConnectionID() string {
-	return fs.connectionID
-}
-
-// Stat returns file information for the specified path.
-func (fs *NatsFs) Stat(name string) (os.FileInfo, error) {
-	info, err := fs.store.GetInfo(name)
-	if err != nil {
-		if errors.Is(err, nats.ErrObjectNotFound) {
-			return nil, os.ErrNotExist
-		}
-		return nil, err
-	}
-	return NewFileInfo(name, false, int64(info.Size), info.ModTime, false), nil
-}
-
-// Lstat returns file information for the specified path.
-// This implementation is identical to Stat as symbolic links are not supported.
-func (fs *NatsFs) Lstat(name string) (os.FileInfo, error) {
-	return fs.Stat(name)
-}
-
-// Open opens a file for reading at the specified offset.
-// It attempts to retrieve the file from the cache first, falling back to NATS storage if necessary.
-func (fs *NatsFs) Open(name string, offset int64) (os.File, PipeReader, func(), error) {
-	// First try to get from the cache
-	if entry, exists := fs.getCached(name); exists {
-		data, err := entry.getData()
-		if err == nil {
-			reader := bytes.NewReader(data[offset:])
-			return os.File{}, &staticReader{r: reader}, func() {}, nil
-		}
-		// If we got an error (expired cache), invalidate the entry
-		fs.invalidateCache(name)
-	}
-
-	// If not in cache or expired, get from NATS
-	obj, err := fs.store.Get(name)
-	if err != nil {
-		return os.File{}, nil, nil, err
-	}
-	defer func(obj nats.ObjectResult) {
-		_ = obj.Close()
-	}(obj)
+	defer obj.Close()
 
 	data, err := io.ReadAll(obj)
 	if err != nil {
-		return os.File{}, nil, nil, err
+		return nil, err
 	}
 
-	// Cache the new data
-	info, err := fs.store.GetInfo(name)
+	info, err := n.store.GetInfo(name)
+	if err != nil {
+		return nil, err
+	}
+
+	file := &NatsFileData{
+		ObjectName:    name,
+		ObjectIsDir:   false,
+		Data:          data,
+		ObjectMode:    0644,
+		ObjectModTime: info.ModTime,
+	}
+
+	n.mu.Lock()
+	n.entries[name] = file
+	n.mu.Unlock()
+
+	return file, nil
+}
+
+func (n *NatsFs) Save(file *NatsFileData) error {
+	if file.ObjectIsDir {
+		return nil // No actual write needed for dirs
+	}
+	_, err := n.store.Put(&nats.ObjectMeta{Name: file.ObjectName}, bytes.NewReader(file.Data))
 	if err == nil {
-		fs.setCached(name, info, data)
+		n.mu.Lock()
+		n.entries[file.ObjectName] = file
+		n.mu.Unlock()
+	}
+	return err
+}
+
+func (n *NatsFs) List(dir string) ([]*NatsFileData, error) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	var files []*NatsFileData
+	prefix := fmt.Sprintf("/%s", strings.TrimSuffix(dir, "/"))
+	for name, file := range n.entries {
+		if strings.HasPrefix(name, prefix) && name != dir {
+			rel := strings.TrimPrefix(name, prefix)
+			if !strings.Contains(rel, "/") {
+				files = append(files, file)
+			}
+		}
+	}
+	return files, nil
+}
+
+func (n *NatsFs) CreateFile(name string, data []byte) (*NatsFileData, error) {
+	file := &NatsFileData{
+		ObjectName:    name,
+		ObjectIsDir:   false,
+		Data:          data,
+		ObjectMode:    0644,
+		ObjectModTime: time.Now(),
+	}
+	return file, n.Save(file)
+}
+
+func (n *NatsFs) CreateDir(name string) *NatsFileData {
+	dir := &NatsFileData{
+		ObjectName:    name,
+		ObjectIsDir:   true,
+		ObjectModTime: time.Now(),
+		ObjectMode:    os.ModeDir | 0755,
+	}
+	n.mu.Lock()
+	n.entries[name] = dir
+	n.mu.Unlock()
+	return dir
+}
+
+func (n *NatsFs) Remove(name string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	delete(n.entries, name)
+	return n.store.Delete(name)
+}
+
+func (n *NatsFs) Stat(name string) (os.FileInfo, error) {
+	n.mu.RLock()
+	entry, ok := n.entries[name]
+	n.mu.RUnlock()
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return entry, nil
+}
+
+func (n *NatsFs) Create(name string) (File, error) {
+	file := &NatsFileData{
+		ObjectName:    name,
+		ObjectIsDir:   false,
+		Data:          make([]byte, 0),
+		ObjectMode:    0644,
+		ObjectModTime: time.Now(),
 	}
 
-	reader := bytes.NewReader(data[offset:])
-	return os.File{}, &staticReader{r: reader}, func() {}, nil
-}
-
-// Create creates a new file or truncates an existing file.
-// It returns a writer that buffers data until it's committed to NATS storage.
-func (fs *NatsFs) Create(name string, flag, checks int) (os.File, PipeWriter, func(), error) {
-	buf := new(bytes.Buffer)
-	return os.File{}, &bufferWriter{
-		name: name,
-		fs:   fs,
-		buf:  buf,
-	}, func() {}, nil
-}
-
-// Remove deletes the specified file from the NATS storage.
-func (fs *NatsFs) Remove(name string, _ bool) error {
-	return fs.store.Delete(name)
-}
-
-func (fs *NatsFs) Mkdir(name string) error {
-	return nil // NATS Object Store is flat
-}
-
-func (fs *NatsFs) Chown(name string, uid int, gid int) error { return nil }
-
-func (fs *NatsFs) Chmod(name string, mode os.FileMode) error { return nil }
-
-func (fs *NatsFs) Chtimes(name string, atime, mtime time.Time, isUploading bool) error {
-	return nil
-}
-
-func (fs *NatsFs) IsUploadResumeSupported() bool { return false }
-
-func (fs *NatsFs) IsConditionalUploadResumeSupported(size int64) bool { return false }
-
-// IsAtomicUploadSupported returns true as this filesystem supports atomic uploads.
-func (fs *NatsFs) IsAtomicUploadSupported() bool { return true }
-
-func (fs *NatsFs) CheckRootPath(username string, uid int, gid int) bool { return true }
-
-func (fs *NatsFs) IsNotExist(err error) bool { return errors.Is(err, os.ErrNotExist) }
-
-func (fs *NatsFs) IsPermission(err error) bool { return false }
-
-func (fs *NatsFs) ScanRootDirContents() (int, int64, error) { return 0, 0, nil }
-
-func (fs *NatsFs) GetDirSize(dirname string) (int, int64, error) { return 0, 0, nil }
-
-func (fs *NatsFs) GetAtomicUploadPath(name string) string { return name }
-
-func (fs *NatsFs) GetRelativePath(name string) string { return name }
-
-func (fs *NatsFs) Join(elem ...string) string { return strings.Join(elem, "/") }
-
-// HasVirtualFolders returns false as this filesystem doesn't support virtual folders.
-func (fs *NatsFs) HasVirtualFolders() bool { return false }
-
-// Close performs cleanup when the filesystem is no longer needed.
-func (fs *NatsFs) Close() error { return nil }
-
-// getMountPath normalizes the provided mount path to ensure it's in a consistent format.
-// It ensures the path:
-// - Always starts with a forward slash
-// - Does not end with a trailing slash (except for a root path "/")
-// - Is cleaned of any redundant separators
-func getMountPath(mountPath string) string {
-	if mountPath == "" {
-		return "/"
+	err := n.Save(file)
+	if err != nil {
+		return nil, err
 	}
-	// Clean the path to remove any redundant separators
-	mountPath = filepath.Clean(mountPath)
-	// Ensure a path starts with /
-	if !strings.HasPrefix(mountPath, "/") {
-		mountPath = fmt.Sprintf("/%s", mountPath)
+
+	return NewNatsFile(file, n), nil
+}
+
+func (n *NatsFs) Mkdir(name string, perm os.FileMode) error {
+	// TODO implement me
+	panic("implement me")
+}
+
+func (n *NatsFs) MkdirAll(path string, perm os.FileMode) error {
+	// TODO implement me
+	panic("implement me")
+}
+
+func (n *NatsFs) Open(name string) (File, error) {
+	// TODO implement me
+	panic("implement me")
+}
+
+func (n *NatsFs) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
+	// TODO implement me
+	panic("implement me")
+}
+
+func (n *NatsFs) RemoveAll(path string) error {
+	// TODO implement me
+	panic("implement me")
+}
+
+func (n *NatsFs) Rename(oldname, newname string) error {
+	file, err := n.Load(oldname)
+	if err != nil {
+		return err
 	}
-	return mountPath
+	file.ObjectName = newname
+	if err := n.Save(file); err != nil {
+		return err
+	}
+	return n.Remove(oldname)
+}
+
+func (n *NatsFs) Name() string {
+	// TODO implement me
+	panic("implement me")
+}
+
+func (n *NatsFs) Chmod(name string, mode os.FileMode) error {
+	// TODO implement me
+	panic("implement me")
+}
+
+func (n *NatsFs) Chown(name string, uid, gid int) error {
+	// TODO implement me
+	panic("implement me")
+}
+
+func (n *NatsFs) Chtimes(name string, atime time.Time, mtime time.Time) error {
+	// TODO implement me
+	panic("implement me")
 }
