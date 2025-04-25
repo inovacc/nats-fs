@@ -1,4 +1,4 @@
-package awesomeProjectNATS_fs
+package natsfs
 
 import (
 	"errors"

@@ -1,6 +1,6 @@
 //go:build !windows
 
-package awesomeProjectNATS_fs
+package natsfs
 
 import (
 	"context"
