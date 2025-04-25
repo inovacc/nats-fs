@@ -14,7 +14,7 @@ A virtual file system backed by NATS JetStream Object Store, mountable via FUSE 
 ## Installation
 
 ```
-go get github.com/inovacc/nats-fs
+go get github.com/inovacc/natsfs
 ```
 
 ## Example Usage
